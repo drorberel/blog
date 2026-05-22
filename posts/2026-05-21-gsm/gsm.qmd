@@ -1,0 +1,561 @@
+---
+title: "GSM"
+author:
+  - name: Dror Berel
+description: "Show how to build a simple KRI reporting workflow in R"
+date: "2026-05-21"
+categories: [Technical]
+image: "pharmaverseblog.png"
+editor_options: 
+  chunk_output_type: console
+---
+
+<!--------------- typical setup ----------------->
+
+```{r setup, include=FALSE}
+long_slug <- "2026-05-21-gsm"
+```
+
+<!--------------- post begins here ----------------->
+
+# Overview
+
+This tutorial shows how to build a simple KRI reporting workflow in R
+using the `gsm` ecosystem.  
+<https://gilead-biostats.github.io/gsm/>   
+As with all `gsm` workflows, there are many ways to accomplish the same
+end goal. This tutorial focuses on a straightforward approach that manually executes each step of the process, which can be helpful for
+users who are new to the framework and want to understand how the pieces fit together. 
+
+# Disclaimer 
+Please refer to the package documentation and vignettes for more details on the individual functions and their parameters, as well as alternative approaches to workflow construction. 
+The author is NOT a contributor to the `gsm` ecosystem and does NOT represent the official voice of the project or its maintainers. The tutorial is meant to be a practical example of how to use the `gsm` packages together, but it is not an official template or endorsed workflow. 
+
+
+# Goal
+The goal is to start from toy clinical
+analysis datasets, calculate two site-level rate metrics, convert those
+metric outputs into the reporting data model expected by `gsm.kri`, and
+then generate the inputs required for an HTML KRI report.
+
+
+The tutorial uses:
+
+-   `pharmaverseadam::adsl` as the subject-level source
+-   `pharmaverseadam::adae` as the event-level source
+-   `gsm.core` for metric calculation
+-   `gsm.mapping` for long-format metadata construction
+-   `gsm.reporting` for report-model objects
+-   `gsm.kri` for charts and report generation
+
+The two metrics in this document are not meant to be clinically
+meaningful production KRIs. They are compact examples that make the
+reporting pipeline easier to understand.
+
+# Note
+the gsm framework also include a workflow engine that can execute a structured workflow definition like the one shown in `examples/kri_report_from_lworkflows.R`. The current tutorial focuses on the manual steps needed to calculate KRIs and prepare reporting data, but the same steps can be automated using the workflow engine once the user is comfortable with the individual pieces. 
+
+# Setup
+
+This section loads the required packages and example datasets.
+
+What this section does:
+
+-   Loads the analysis, reporting, and visualization packages.
+-   Loads two toy ADaM datasets used in the rest of the tutorial.
+
+Inputs:
+
+| Input | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| Installed R packages | `gsm`, `gsm.core`, `gsm.kri`, `gsm.mapping`, `gsm.reporting`, `tidyverse`, and `pharmaverseadam`. | Provide the analysis, reporting, visualization, and toy-data functionality used throughout the tutorial. |
+| Built-in example data | Example datasets shipped in `pharmaverseadam`. | Supply the toy clinical inputs used in the KRI calculations. |
+
+Outputs:
+
+| Object | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `adsl` | Tibble-like `data.frame` containing subject-level records. | Used as the denominator population and as the source of site/study metadata. |
+| `adae` | Tibble-like `data.frame` containing adverse-event-level records. | Used as the numerator event source. |
+
+```{r}
+library(gsm.core) # pak::pak('https://github.com/Gilead-BioStats/gsm.core')
+library(gsm.kri) # pak::pak('https://github.com/Gilead-BioStats/gsm.kri')
+library(gsm.mapping) # pak::pak("Gilead-BioStats/gsm.mapping")
+library(gsm.reporting) # pak::pak("Gilead-BioStats/gsm.reporting")
+
+library(tidyverse)
+library(pharmaverseadam)
+
+adsl <- pharmaverseadam::adsl
+adae <- pharmaverseadam::adae
+```
+
+# Metric Inputs
+
+This section prepares shared inputs that both KRIs will reuse.
+
+What this section does:
+
+-   Counts records by site for a quick check of site distribution.
+-   Builds threshold and scoring vectors used in the flagging step.
+
+Inputs:
+
+| Input | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `adsl` | Subject-level dataset with `SITEID`. | Provides the site structure used to derive exploratory counts and shared thresholding context. |
+
+Outputs:
+
+| Object | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `site_subjects` | Tibble with one row per `SITEID` and a count of records. | Quick exploratory summary of the site distribution. |
+| `v_threshold` | Numeric vector of threshold breakpoints used by `Flag_NormalApprox()`. | Defines the statistical cutoffs for flag assignment. |
+| `v_flag` | Numeric vector of flag values corresponding to threshold regions. | Encodes the site-level flag category. |
+| `v_risk_score_weight` | Numeric vector of risk-score weights tied to flag categories. | Provides weighted scoring for the final flagged output. |
+
+```{r}
+site_subjects <- adsl %>%
+  count(SITEID)
+
+v_threshold <- gsm.core::ParseThreshold("-3,-2,2,3")
+v_flag <- gsm.core::ParseThreshold("-2,-1,0,1,2", bSort = FALSE)
+v_risk_score_weight <- gsm.core::ParseThreshold("8,4,0,8,16", bSort = FALSE)
+```
+
+# KRI 1
+
+This section calculates the first rate-based KRI from the full `adae`
+dataset.
+
+What this section does:
+
+-   Builds a grouped rate input with `Input_Rate()`.
+-   Applies the standard rate transformation.
+-   Runs a normal approximation analysis.
+-   Flags each site using the threshold vectors created earlier.
+-   Produces a summarized analysis table.
+-   Creates prediction bounds and a scatterplot widget for inspection.
+
+Inputs:
+
+| Input | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `adsl` | `data.frame`/tibble containing subject-level records. | Provides denominator data and site grouping structure. |
+| `adae` | `data.frame`/tibble containing event-level records. | Provides numerator event data. |
+| `v_threshold` | Numeric vector of threshold breakpoints. | Controls thresholding in the flagging step. |
+| `v_flag` | Numeric vector of flag values. | Controls category assignment during flagging. |
+| `v_risk_score_weight` | Numeric vector of risk-score weights. | Controls weighted risk-score assignment in the flagged output. |
+
+Outputs:
+
+| Object | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `KRI_1` | `data.frame`/tibble containing summarized site-level metric output from `gsm.core::Summarize()`. | Main result object for the first metric; later included in the reporting layer. |
+| `label_AE_1` | Named `list` containing chart labels for metric, numerator, and denominator. | Used by the widget for display text. |
+| `dfbooud_ad_1` | `data.frame` containing model-based prediction bounds for plotting. | Used by the scatterplot widget. |
+| `Widget_ScatterPlot(...)` | Htmlwidget-like object. | Visual inspection of metric behavior by site. |
+
+```{r}
+KRI_1 <- gsm.core::Input_Rate(
+  dfSubjects = adsl,
+  dfNumerator = adae,
+  dfDenominator = adsl,
+  strSubjectCol = "USUBJID",
+  strGroupCol = "SITEID",
+  strNumeratorMethod = "Count"
+) %>%
+  gsm.core::Transform_Rate() %>%
+  gsm.core::Analyze_NormalApprox(strType = "rate") %>%
+  gsm.core::Flag_NormalApprox(
+    vThreshold = v_threshold,
+    vFlag = v_flag,
+    vRiskScoreWeight = v_risk_score_weight,
+    nAccrualThreshold = 30,
+    strAccrualMetric = "Denominator"
+  ) %>%
+  gsm.core::Summarize()
+
+label_AE_1 <- list(
+  Metric = "AE",
+  Numerator = "Count of AEs",
+  Denominator = "Count of Subjects"
+)
+
+dfbooud_ad_1 <- Analyze_NormalApprox_PredictBounds(KRI_1, strType = "rate")
+Widget_ScatterPlot(KRI_1, lMetric = label_AE_1, dfBounds = dfbooud_ad_1)
+```
+
+The scatterplot widget allows for visual inspection of the site-level metric values, flags, and model-based bounds. This can be helpful for validating the analysis results before including them in the final report.
+the Widget_ScatterPlot() functions call a js file that is included in the package.  
+See <https://github.com/Gilead-BioStats/gsm.kri/tree/dev/inst/htmlwidgets>
+
+
+# KRI 2
+
+This section calculates a second site-level rate KRI using a reduced
+event dataset. Typically it will be a different metric than the first
+KRI, but for simplicity this example reuses the same rate-based approach
+with a smaller numerator source.  
+Common metrics include the following:  
+- Serious Adverse Event Reporting Rate\
+- Non-important Protocol Deviation Rate\
+- Important Protocol Deviation Rate\
+- Grade 3+ Lab Abnormality Rate\
+- Study Discontinuation Rate\
+- Treatment Discontinuation Rate\
+- Query Rate\
+- Outstanding Query Rate\
+- Outstanding Data Entry Rate\
+- Data Change Rate\
+- Screen Failure Rate
+
+What this section does:
+
+-   Repeats the same analytic steps used for `KRI_1`.
+-   Uses `adae %>% head(1000)` as the numerator source.
+-   Produces a second summarized KRI object that can be included in the
+    same report.
+
+Inputs:
+
+| Input | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `adsl` | `data.frame`/tibble containing subject-level records. | Provides denominator data and site grouping structure. |
+| `adae %>% head(1000)` | Reduced `data.frame`/tibble containing event-level records. | Provides a smaller numerator event source for the second KRI. |
+| `v_threshold` | Numeric vector of threshold breakpoints. | Controls thresholding in the flagging step. |
+| `v_flag` | Numeric vector of flag values. | Controls category assignment during flagging. |
+| `v_risk_score_weight` | Numeric vector of risk-score weights. | Controls weighted risk-score assignment in the flagged output. |
+
+Outputs:
+
+| Object | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `KRI_2` | `data.frame`/tibble containing summarized site-level metric output from `gsm.core::Summarize()`. | Second analysis result used in the final report. |
+| `label_SAE` | Named `list` containing chart labels for the second metric. | Used by the widget for display text. |
+| `dfbooud_ad_2` | `data.frame` containing prediction bounds for plotting. | Supports the second scatterplot. |
+| `Widget_ScatterPlot(...)` | Htmlwidget-like object. | Visual inspection of the second metric. |
+
+```{r}
+KRI_2 <- gsm.core::Input_Rate(
+  dfSubjects = adsl,
+  dfNumerator = adae %>% head(1000),
+  dfDenominator = adsl,
+  strSubjectCol = "USUBJID",
+  strGroupCol = "SITEID",
+  strNumeratorMethod = "Count"
+) %>%
+  gsm.core::Transform_Rate() %>%
+  gsm.core::Analyze_NormalApprox(strType = "rate") %>%
+  gsm.core::Flag_NormalApprox(
+    vThreshold = v_threshold,
+    vFlag = v_flag,
+    vRiskScoreWeight = v_risk_score_weight,
+    nAccrualThreshold = 30,
+    strAccrualMetric = "Denominator"
+  ) %>%
+  gsm.core::Summarize()
+
+label_SAE <- list(
+  Metric = "SAE",
+  Numerator = "Count of SAEs",
+  Denominator = "Count of Subjects"
+)
+
+dfbooud_ad_2 <- Analyze_NormalApprox_PredictBounds(KRI_2, strType = "rate")
+Widget_ScatterPlot(KRI_2, lMetric = label_SAE, dfBounds = dfbooud_ad_2)
+```
+
+# Reporting Data
+
+This section converts the KRI analysis outputs into the data model
+expected by `gsm.kri`.
+
+`Report_KRI()` does not consume `KRI_1` and `KRI_2` directly. It expects
+a set of structured reporting objects:
+
+-   study metadata,
+-   group metadata,
+-   metric metadata,
+-   bound analysis results,
+-   and plotting bounds.
+
+## Study Metadata
+
+This subsection creates high-level report identifiers.
+
+Inputs:
+
+| Input | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `adsl` | Subject-level dataset containing `STUDYID`. | Supplies the high-level study identifier used to label the report snapshot. |
+
+Outputs:
+
+| Object | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `study_id` | Character scalar holding the first `STUDYID` value from `adsl`. | Labels the report output with the study identifier. |
+| `snapshot_date` | `Date` object holding the current system date. | Records when the report snapshot was built. |
+
+```{r}
+study_id <- adsl %>%
+  summarise(STUDYID = first(STUDYID)) %>%
+  pull(STUDYID)
+
+snapshot_date <- Sys.Date()
+```
+
+## Group Metadata
+
+This subsection creates `dfGroups`, the long-format metadata table used
+by the report.
+
+What this section does:
+
+-   Creates site-level count metadata.
+-   Creates site-level descriptive metadata.
+-   Creates study-level count metadata.
+-   Creates study-level descriptive metadata.
+-   Binds them into one long table.
+
+Inputs:
+
+| Input | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `adsl` | Subject-level dataset containing site and study identifiers. | Supplies the raw information used to derive site-level and study-level group metadata. |
+
+Outputs:
+
+| Object | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `dfSiteCounts` | Tibble containing site-level participant and site counts in long format. | Quantitative site metadata for the report. |
+| `dfSiteMeta` | Tibble containing site-level descriptive fields such as `Status` and `InvestigatorLastName`. | Textual site metadata and site labeling support. |
+| `dfStudyCounts` | Tibble containing study-level counts in long format. | Study summary metadata. |
+| `dfStudyMeta` | Tibble containing study-level descriptive fields. | High-level study metadata. |
+| `dfGroups` | Tibble containing the union of all group metadata rows. | Master group metadata object consumed by `gsm.kri`. |
+
+```{r}
+dfSiteCounts <- adsl %>%
+  group_by(SITEID) %>%
+  summarise(
+    ParticipantCount = n_distinct(USUBJID),
+    SiteCount = 1L,
+    .groups = "drop"
+  ) %>%
+  rename(GroupID = SITEID) %>%
+  gsm.mapping::MakeLongMeta(strGroupLevel = "Site")
+
+dfSiteMeta <- adsl %>%
+  distinct(SITEID) %>%
+  transmute(
+    GroupID = SITEID,
+    Status = "Active",
+    InvestigatorLastName = paste0("Site ", SITEID)
+  ) %>%
+  gsm.mapping::MakeLongMeta(strGroupLevel = "Site")
+
+dfStudyCounts <- adsl %>%
+  summarise(
+    GroupID = first(STUDYID),
+    ParticipantCount = n_distinct(USUBJID),
+    SiteCount = n_distinct(SITEID)
+  ) %>%
+  gsm.mapping::MakeLongMeta(strGroupLevel = "Study")
+
+dfStudyMeta <- adsl %>%
+  summarise(
+    GroupID = first(STUDYID),
+    Status = "Active"
+  ) %>%
+  gsm.mapping::MakeLongMeta(strGroupLevel = "Study")
+
+dfGroups <- bind_rows(
+  SiteCounts = dfSiteCounts,
+  Site = dfSiteMeta,
+  StudyCounts = dfStudyCounts,
+  Study = dfStudyMeta
+)
+```
+
+## Metric Metadata
+
+This subsection creates `dfMetrics`, the metric catalog used by the
+reporting layer.
+
+What this section does:
+
+-   Defines a lightweight `lWorkflows` object containing metadata for
+    the two KRIs.
+-   Converts that metadata into the standard reporting metrics table.
+
+Inputs:
+
+| Input | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| Workflow metadata definition | Named R `list` describing each metric in a `meta` block. | Supplies the metric metadata that `gsm.reporting::MakeMetric()` converts into the standard metrics table. |
+
+Outputs:
+
+| Object | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `lWorkflows` | Named `list` containing metric metadata for `AE` and `SAE`. | Intermediate metadata definition used by `MakeMetric()`. |
+| `dfMetrics` | Tibble containing a standardized metric metadata table. | Tells the reporting layer how each metric should be labeled and interpreted. |
+
+```{r}
+lWorkflows <- list(
+  AE = list(
+    meta = list(
+      Type = "Analysis",
+      ID = "AE",
+      GroupLevel = "Site",
+      Abbreviation = "AE",
+      Metric = "Adverse Event Rate",
+      Numerator = "Count of AEs",
+      Denominator = "Count of Subjects",
+      Model = "Normal Approximation",
+      Score = "Adjusted Z-Score",
+      Threshold = "-3,-2,2,3"
+    )
+  ),
+  SAE = list(
+    meta = list(
+      Type = "Analysis",
+      ID = "SAE",
+      GroupLevel = "Site",
+      Abbreviation = "SAE",
+      Metric = "Serious Adverse Event Rate",
+      Numerator = "Count of SAEs",
+      Denominator = "Count of Subjects",
+      Model = "Normal Approximation",
+      Score = "Adjusted Z-Score",
+      Threshold = "-3,-2,2,3"
+    )
+  )
+)
+
+dfMetrics <- gsm.reporting::MakeMetric(lWorkflows = lWorkflows)
+```
+
+## Binding Analysis Results
+
+This subsection turns `KRI_1` and `KRI_2` into the long-format result
+objects used by charts and reports.
+
+What this section does:
+
+-   Wraps each KRI result under the `Analysis_Summary` key expected by
+    `BindResults()`.
+-   Binds both KRIs into a single report-results table.
+-   Computes plotting bounds from the combined results and metric
+    metadata.
+
+Inputs:
+
+| Input | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `KRI_1` | Summarized first KRI result. | Supplies the first analysis summary to the reporting layer. |
+| `KRI_2` | Summarized second KRI result. | Supplies the second analysis summary to the reporting layer. |
+| `study_id` | Character study identifier. | Labels the bound results with the study ID. |
+| `snapshot_date` | `Date` object for the current report snapshot. | Labels the bound results with the reporting date. |
+| `dfMetrics` | Metric metadata table. | Supplies metadata needed to standardize and bound the combined results. |
+
+Outputs:
+
+| Object | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `lAnalyzed` | Named nested `list` containing `KRI_1` and `KRI_2` stored as analysis summaries. | Input container for `BindResults()`. |
+| `dfResults` | Tibble containing long-format combined KRI results with study and snapshot metadata. | Central results table for downstream charting and reporting. |
+| `dfBounds` | Tibble containing plotting-bound information derived from `dfResults` and `dfMetrics`. | Supports visual rendering in `MakeCharts()`. |
+
+```{r}
+lAnalyzed <- list(
+  Analysis_AE = list(Analysis_Summary = KRI_1),
+  Analysis_SAE = list(Analysis_Summary = KRI_2)
+)
+
+dfResults <- gsm.reporting::BindResults(
+  lAnalysis = lAnalyzed,
+  strName = "Analysis_Summary",
+  dSnapshotDate = snapshot_date,
+  strStudyID = study_id
+)
+
+dfBounds <- gsm.reporting::MakeBounds(
+  dfResults = dfResults,
+  dfMetrics = dfMetrics
+)
+```
+
+# Report
+
+This final section creates charts and then uses them, together with the
+reporting tables, to generate the HTML KRI report.
+
+What this section does:
+
+-   Builds visual components from the results and metadata.
+-   Prepares the final inputs for `Report_KRI()`.
+-   Shows the exact report call, which can be uncommented when the
+    upstream objects are validated in the local environment.
+
+Inputs:
+
+| Input | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `dfResults` | Tibble of bound analysis results. | Supplies the core metric results to charting and report generation. |
+| `dfGroups` | Tibble of group metadata. | Supplies site/study context and label information to the report. |
+| `dfMetrics` | Tibble of metric metadata. | Supplies metric labels, grouping metadata, and interpretation details. |
+| `dfBounds` | Tibble of plotting bounds. | Supplies visual bound information used when generating charts. |
+
+Outputs:
+
+| Object | Content | Purpose |
+|------------------------|------------------------|------------------------|
+| `lCharts` | Named `list` containing chart/widget objects produced by `gsm.kri::MakeCharts()`. | Visual sections used inside the final report. |
+| `lReport` | Report object returned by `gsm.kri::Report_KRI()` when the call is executed. | Captures the report-generation result. |
+| `test_kri_report.html` | HTML file written to disk when the report call is enabled. | Final rendered report artifact. |
+
+```{r}
+lCharts <- gsm.kri::MakeCharts(
+  dfResults = dfResults,
+  dfGroups = dfGroups,
+  dfMetrics = dfMetrics,
+  dfBounds = dfBounds
+)
+```
+
+The final report generation step is included but not executed, since the
+upstream objects are not meant to be production-ready. The tutorial
+focuses on the data manipulation and metric calculation steps that lead
+up to the report call, which can be enabled once the user has validated
+the intermediate objects in their local environment.
+
+```{r, eval = FALSE}
+lReport <- gsm.kri::Report_KRI(
+  lCharts = lCharts,
+  dfResults = dfResults,
+  dfGroups = dfGroups,
+  dfMetrics = dfMetrics,
+  strInputPath = system.file("report", "Report_KRI.Rmd", package = "gsm.kri")
+  strOutputFile = "test_kri_report.html"
+)
+```
+
+It uses a built-in Rmd template that comes with `gsm.kri`, but users can also build their own custom Rmd templates that consume the same data model. The report call will render the
+report and write the HTML output to disk, which can then be shared with stakeholders.
+
+
+
+
+<!--------------- appendices go here ----------------->
+
+```{r, echo=FALSE}
+source("appendix.R")
+insert_appendix(
+  repo_spec = "pharmaverse/blog",
+  name = long_slug,
+  # file_name should be the name of your file
+  file_name = list.files() %>% stringr::str_subset(".qmd") %>% first()
+)
+```
