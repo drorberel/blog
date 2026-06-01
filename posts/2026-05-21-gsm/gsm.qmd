@@ -5,7 +5,6 @@ author:
 description: "Show how to build a simple KRI reporting workflow in R"
 date: "2026-05-21"
 categories: [Technical]
-image: "pharmaverseblog.png"
 editor_options: 
   chunk_output_type: console
 ---
@@ -240,7 +239,7 @@ Outputs:
 ```{r}
 KRI_2 <- gsm.core::Input_Rate(
   dfSubjects = adsl,
-  dfNumerator = adae %>% head(1000),
+  dfNumerator = adae %>% filter(AESER == 'Y'),
   dfDenominator = adsl,
   strSubjectCol = "USUBJID",
   strGroupCol = "SITEID",
@@ -330,7 +329,7 @@ Outputs:
 | Object | Content | Purpose |
 |------------------------|------------------------|------------------------|
 | `dfSiteCounts` | Tibble containing site-level participant and site counts in long format. | Quantitative site metadata for the report. |
-| `dfSiteMeta` | Tibble containing site-level descriptive fields such as `Status` and `InvestigatorLastName`. | Textual site metadata and site labeling support. |
+| `dfSiteMeta` | Tibble containing site-level descriptive fields such as `Status`. | Textual site metadata and site labeling support. |
 | `dfStudyCounts` | Tibble containing study-level counts in long format. | Study summary metadata. |
 | `dfStudyMeta` | Tibble containing study-level descriptive fields. | High-level study metadata. |
 | `dfGroups` | Tibble containing the union of all group metadata rows. | Master group metadata object consumed by `gsm.kri`. |
@@ -537,7 +536,7 @@ lReport <- gsm.kri::Report_KRI(
   dfResults = dfResults,
   dfGroups = dfGroups,
   dfMetrics = dfMetrics,
-  strInputPath = system.file("report", "Report_KRI.Rmd", package = "gsm.kri")
+  strInputPath = system.file("report", "Report_KRI.Rmd", package = "gsm.kri"),
   strOutputFile = "test_kri_report.html"
 )
 ```
